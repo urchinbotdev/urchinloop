@@ -491,6 +491,44 @@ async function runPostResponseJobs(storage, messages, history, callLLM, settings
   const convCount = parseInt(urchinMemory._convCount || '0', 10) + 1;
   urchinMemory._convCount = String(convCount);
 
+  // 0) Implicit satisfaction signal from conversation patterns
+  if (activeSkillNames.length > 0 && history.length >= 2) {
+    try {
+      const { urchinSkills = [] } = await storage.get('urchinSkills');
+      let signal = 0;
+      const lastUserMsgs = history.filter(h => h.role === 'user').slice(-3).map(h => h.text.toLowerCase());
+      const negPatterns = [
+        /\bno\b.*\bwrong\b/, /\bstop\b.*\bdoing\b/, /\bdon'?t\b.*\bdo that\b/,
+        /\bnot what i\b/, /\bi didn'?t ask\b/, /\bthat'?s wrong\b/, /\btry again\b/,
+        /\bincorrect\b/, /\bwrong\b/, /\bnot helpful\b/, /\buseless\b/,
+        /\bno[,.]?\s*(that|this) is/, /\bactually[,.]?\s*(i|it|the)\b/
+      ];
+      const posPatterns = [
+        /\bthanks?\b/, /\bthank you\b/, /\bperfect\b/, /\bgreat\b/, /\bexactly\b/,
+        /\bnice\b/, /\bawesome\b/, /\bgood job\b/, /\blove it\b/, /\bnailed it\b/
+      ];
+      for (const msg of lastUserMsgs) {
+        if (negPatterns.some(p => p.test(msg))) signal -= 15;
+        if (posPatterns.some(p => p.test(msg))) signal += 10;
+      }
+      if (history.length <= 2 && !posPatterns.some(p => p.test(lastUserMsgs[lastUserMsgs.length - 1] || ''))) signal -= 3;
+      if (history.length >= 8) signal += 5;
+      if (signal !== 0) {
+        let updated = false;
+        for (const skill of urchinSkills) {
+          if (activeSkillNames.includes(skill.name)) {
+            const delta = Math.max(-20, Math.min(15, signal));
+            skill.score = Math.max(0, Math.min(100, Math.round((skill.score ?? 50) + delta)));
+            skill.lastSignalAt = Date.now();
+            skill.signalCount = (skill.signalCount || 0) + 1;
+            updated = true;
+          }
+        }
+        if (updated) await storage.set({ urchinSkills });
+      }
+    } catch (_) {}
+  }
+
   // A) Session summary — every 3rd conversation
   if (convCount % 3 === 0 && messages.length >= 3) {
     try {
@@ -617,8 +655,42 @@ async function urchinLoop(userInput, options = {}) {
 
   let finalAnswer = '';
   const log = { steps: [], startTime: Date.now() };
+  let effectiveMaxSteps = maxSteps;
 
-  for (let step = 0; step < maxSteps; step++) {
+  // Goal decomposition — break multi-phase requests into subtask chains
+  let decomposed = false;
+  try {
+    const hasMultipleVerbs = (userInput.match(/\b(and|then|also|after that|next|finally)\b/gi) || []).length >= 2;
+    if ((hasMultipleVerbs || userInput.length > 120) && !/^(hi|hey|hello|what|who|how much|price|gm)/i.test(userInput.trim())) {
+      const planPrompt = `Decide if this request needs subtask decomposition. Only decompose if it has multiple INDEPENDENT phases producing different outputs. Single tasks should NOT be decomposed.\n\nRequest: "${userInput.slice(0, 500)}"\n\nIf needed: {"decompose":true,"subtasks":[{"task":"description","dependsOn":[]}]}\nMax 4 subtasks. dependsOn = array of 0-indexed prior subtask numbers.\nIf single task: {"decompose":false}\nOutput ONLY JSON.`;
+      const planRaw = await callLLM('Output ONLY JSON.', [{ role: 'user', content: planPrompt }], settings);
+      const plan = extractJSON(planRaw);
+      if (plan?.decompose && Array.isArray(plan.subtasks) && plan.subtasks.length >= 2 && plan.subtasks.length <= 4) {
+        decomposed = true;
+        log.steps.push({ type: 'goal_decompose', subtasks: plan.subtasks.map(s => s.task) });
+        const subtaskResults = [];
+        for (let si = 0; si < plan.subtasks.length; si++) {
+          const st = plan.subtasks[si];
+          let stInput = st.task;
+          if (st.dependsOn?.length > 0) {
+            const prior = st.dependsOn.filter(d => d < si && subtaskResults[d]).map(d => `[Step ${d + 1} result]: ${subtaskResults[d].slice(0, 2000)}`).join('\n');
+            stInput += `\n\nContext from previous steps:\n${prior}`;
+          }
+          try {
+            const sub = await urchinLoop(stInput, { ...options, runPostJobs: false, maxSteps: 8 });
+            subtaskResults.push(sub.answer || 'No result');
+          } catch (e) {
+            subtaskResults.push(`Failed: ${e.message}`);
+          }
+        }
+        const synthPrompt = `Synthesize these step results into one response.\n\nOriginal: "${userInput.slice(0, 500)}"\n\n${plan.subtasks.map((st, i) => `Step ${i + 1} (${st.task}): ${(subtaskResults[i] || '').slice(0, 2000)}`).join('\n\n')}\n\nWrite a unified, concise response.`;
+        finalAnswer = await callLLM(systemPrompt, [...messages, { role: 'user', content: synthPrompt }], settings);
+        effectiveMaxSteps = 0;
+      }
+    }
+  } catch (_) {}
+
+  for (let step = 0; step < effectiveMaxSteps; step++) {
     if (onStep) onStep(step + 1, maxSteps, messages);
 
     const raw = await callLLM(systemPrompt, messages, settings);
