@@ -19,7 +19,7 @@ UrchinLoop is not a chatbot wrapper. It is a deterministic think-act-observe loo
   │        v                v                   │
   │   ┌─────────────────────────┐               │
   │   │      Message Builder    │               │
-  │   │  (layers 1-5 injected)  │               │
+  │   │  (layers 1-6 injected)  │               │
   │   └────────────┬────────────┘               │
   │                v                            │
   │   ┌─────────────────────────┐               │
@@ -51,7 +51,7 @@ Every request runs through this cycle:
 
 ### 1. Load Memory
 
-Five layers of memory are loaded and injected into the LLM context:
+Six layers of memory are loaded and injected into the LLM context:
 
 | Layer | Source | Persistence | Size |
 |-------|--------|-------------|------|
@@ -60,6 +60,7 @@ Five layers of memory are loaded and injected into the LLM context:
 | User Profile | Auto-extracted user knowledge (wallets, preferences, projects) | Permanent, auto-updated | Unlimited keys |
 | Session Summaries | Bullet-point summaries of past sessions | Last 20 kept, 1500 chars each | 20 entries |
 | Manual Memories | Explicitly saved via REMEMBER tool | Permanent until wiped | Unlimited keys |
+| Learned Skills | Self-evolving behavioral instructions, scored 0-100 | Auto-pruned when ineffective | Up to 50 skills |
 
 ### 2. Build Context
 
@@ -249,10 +250,12 @@ const exampleTools = {
 
 | Key | Description |
 |-----|-------------|
-| `condensed` | Compressed narrative of old conversations |
-| `memory` | Session summaries + manual memories |
-| `profile` | Auto-extracted user profile |
-| `chatHistory` | Raw chat messages (max 200) |
+| `urchinCondensed` | Compressed narrative of old conversations |
+| `urchinMemory` | Session summaries + manual memories + conversation count |
+| `urchinProfile` | Auto-extracted user profile |
+| `urchinChatHistory` | Raw chat messages (max 200) |
+| `urchinSkills` | Learned behavioral skills with scores, usage counts, eval history |
+| `urchinEmbeddingCache` | Cached embedding vectors for semantic memory search (max 300) |
 
 ---
 
@@ -287,7 +290,65 @@ The core loop, tool regex, and message flow stay the same.
 
 MIT
 
+## Full Implementation
+
+The `urchinloop.js` file in this folder is a complete, portable implementation you can drop into any project. It includes:
+
+- **All 6 memory layers** — condensed history, recent messages, profile, session summaries, manual memories, learned skills (scored & pruned)
+- **Built-in tools** — `WEB_SEARCH`, `FETCH_URL`, `REMEMBER`, `RECALL`, `SEARCH_MEMORY` (embeddings-based with keyword fallback)
+- **Post-response jobs** — automatic session summarization, profile extraction, history condensation, skill self-evaluation & pruning
+- **Pluggable storage** — default in-memory; replace with `localStorage`, Redis, or any async key-value store
+- **Pluggable LLM** — default OpenAI-compatible; swap for Anthropic, local models, etc.
+
+### Quick Start
+
+**Node.js (CommonJS):**
+```javascript
+const { urchinLoop, createMemoryStorage, defaultCallLLM } = require('./urchinloop.js');
+
+const storage = createMemoryStorage();
+const result = await urchinLoop('What is the price of Bitcoin?', {
+  callLLM: defaultCallLLM,
+  storage,
+  settings: { llmApiKey: 'sk-...', llmModel: 'gpt-4o-mini' },
+});
+
+console.log(result.answer);
+```
+
+**Browser (script tag):**
+```html
+<script src="urchinloop.js"></script>
+<script>
+  const { urchinLoop, createMemoryStorage, defaultCallLLM } = UrchinLoop;
+  // ...
+</script>
+```
+
+**ESM (Node with "type": "module" or bundler):**
+```javascript
+const { urchinLoop, createMemoryStorage, defaultCallLLM } = await import('./urchinloop.js');
+```
+
+### Custom Tools
+
+```javascript
+await urchinLoop('Scan token XYZ', {
+  storage,
+  callLLM,
+  tools: {
+    SCAN_TOKEN: async (mintAddress) => {
+      const data = await fetch(`https://api.example.com/scan/${mintAddress}`).then(r => r.json());
+      return { success: true, ...data };
+    },
+  },
+});
+```
+
+---
+
 ## Links
 
 - [urchinbot on X](https://x.com/urchinbot)
-- [Full implementation](../../urchinbot-extension/background.js) — see `urchinLoop()` around line 1126
+- [urchinloop.js](./urchinloop.js) — full portable implementation in this folder
+- [Chrome extension implementation](../../urchinbot-extension/background.js) — see `urchinLoop()` around line 1126
