@@ -12,14 +12,14 @@ UrchinLoop is not a chatbot wrapper. It is a deterministic think-act-observe loo
                     UrchinLoop Engine
   ┌─────────────────────────────────────────────┐
   │   ┌──────────┐    ┌──────────┐              │
-  │   │  Memory   │    │  Context  │            │
-  │   │  System   │    │  Builder  │            │
+  │   │  Memory   │    │  Context  │              │
+  │   │  System   │    │  Builder  │              │
   │   └────┬─────┘    └─────┬────┘              │
   │        │                │                   │
   │        v                v                   │
   │   ┌─────────────────────────┐               │
   │   │      Message Builder    │               │
-  │   │  (layers 1-6 injected)  │               │
+  │   │  (layers 1-7 injected)  │               │
   │   └────────────┬────────────┘               │
   │                v                            │
   │   ┌─────────────────────────┐               │
@@ -51,7 +51,7 @@ UrchinLoop is not a chatbot wrapper. It is a deterministic think-act-observe loo
      v              v              v
   ┌──────┐    ┌──────────┐    ┌─────────┐
   │ LLM  │    │  Tools   │    │ Storage │
-  │ API  │    │ (16+)    │    │ (local) │
+  │ API  │    │ (33)     │    │ (local) │
   └──────┘    └──────────┘    └─────────┘
 ```
 
@@ -63,7 +63,7 @@ Every request runs through this cycle:
 
 ### 1. Load Memory
 
-Six layers of memory are loaded and injected into the LLM context:
+Seven layers of memory are loaded and injected into the LLM context:
 
 | Layer | Source | Persistence | Size |
 |-------|--------|-------------|------|
@@ -73,6 +73,7 @@ Six layers of memory are loaded and injected into the LLM context:
 | Session Summaries | Bullet-point summaries of past sessions | Last 20 kept, relevance-filtered on injection | 20 entries |
 | Manual Memories | Explicitly saved via REMEMBER tool | Permanent, capped at 100, oldest evicted | 100 entries |
 | Learned Skills | Self-evolving behavioral instructions, scored 0-100 | Auto-pruned when ineffective | Up to 50 skills |
+| Project Plans | Multi-session goals, milestones, progress | Up to 10 projects, oldest evicted | 10 entries |
 
 Layers 4 and 5 are **relevance-filtered** — when more than 6 entries exist, only memories semantically relevant to the current user message are injected into context. This prevents context rot as memory accumulates over time. The most recent session summary is always included for conversational continuity.
 
@@ -285,7 +286,8 @@ const exampleTools = {
 | `urchinMemory` | Session summaries + manual memories + conversation count |
 | `urchinProfile` | Auto-extracted user profile |
 | `urchinChatHistory` | Raw chat messages (max 200) |
-| `urchinSkills` | Learned behavioral skills with scores, usage counts, signal counts, eval history |
+| `urchinSkills` | Learned behavioral skills with scores, usage counts, signal counts, feedback counts, eval history |
+| `urchinProjects` | Multi-session project plans (goals, milestones, progress) — max 10 |
 | `urchinEmbeddingCache` | Cached embedding vectors for semantic memory search (max 300) |
 
 ---
@@ -325,12 +327,12 @@ MIT
 
 The `urchinloop.js` file in this folder is a complete, portable implementation you can drop into any project. It includes:
 
-- **All 6 memory layers** — condensed history, recent messages, profile (capped at 50), session summaries, manual memories (capped at 100), learned skills (scored & pruned)
+- **All 7 memory layers** — condensed history, recent messages, profile (capped at 50), session summaries, manual memories (capped at 100), learned skills (scored & pruned), project plans (capped at 10)
 - **Relevance-filtered injection** — sessions and memories are filtered by semantic similarity to the current message, preventing context rot
 - **Goal decomposition** — multi-phase requests planned into subtask chains with dependency tracking, each running through the full loop recursively
 - **Implicit satisfaction signals** — detects user corrections, frustration, praise, and conversation length to adjust skill scores every turn
-- **Built-in tools** — `WEB_SEARCH`, `FETCH_URL`, `REMEMBER`, `RECALL`, `SEARCH_MEMORY` (embeddings-based with keyword fallback)
-- **Post-response jobs** — satisfaction signal processing, session summarization, profile extraction, history condensation, skill self-evaluation & pruning
+- **Built-in tools** — `WEB_SEARCH`, `FETCH_URL`, `REMEMBER`, `RECALL`, `SEARCH_MEMORY`, `SET_GOAL`, `UPDATE_GOAL`, `GET_GOALS` (plus embeddings-based memory search)
+- **Post-response jobs** — satisfaction signals, user feedback, session summarization, profile extraction, history condensation, skill self-evaluation & pruning
 - **Pluggable storage** — default in-memory; replace with `localStorage`, Redis, or any async key-value store
 - **Pluggable LLM** — default OpenAI-compatible; swap for Anthropic, local models, etc.
 
