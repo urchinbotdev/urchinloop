@@ -312,6 +312,58 @@ function createBuiltInTools(storage) {
         return { error: `Memory search failed: ${e.message}` };
       }
     },
+
+    SET_GOAL: async (param) => {
+      try {
+        const plan = extractJSON(param) || JSON.parse(param);
+        if (!plan.project) return { error: 'Need a "project" name.' };
+        const { urchinProjects = {} } = await storage.get('urchinProjects');
+        urchinProjects[plan.project] = {
+          goals: plan.goals || [],
+          milestones: (plan.milestones || []).map(m => ({
+            name: m.name, tasks: m.tasks || [], status: m.status || 'pending',
+            notes: m.notes || '', updatedAt: Date.now()
+          })),
+          createdAt: urchinProjects[plan.project]?.createdAt || Date.now(),
+          updatedAt: Date.now()
+        };
+        const keys = Object.keys(urchinProjects);
+        if (keys.length > 10) delete urchinProjects[keys[0]];
+        await storage.set({ urchinProjects });
+        return { success: true, message: `Project "${plan.project}" saved with ${plan.milestones?.length || 0} milestones.` };
+      } catch (e) { return { error: `Set goal failed: ${e.message}` }; }
+    },
+
+    UPDATE_GOAL: async (param) => {
+      try {
+        const upd = extractJSON(param) || JSON.parse(param);
+        if (!upd.project || !upd.milestone) return { error: 'Need "project" and "milestone".' };
+        const { urchinProjects = {} } = await storage.get('urchinProjects');
+        const proj = urchinProjects[upd.project];
+        if (!proj) return { error: `No project "${upd.project}".` };
+        const ms = proj.milestones.find(m => m.name === upd.milestone);
+        if (!ms) return { error: `No milestone "${upd.milestone}".` };
+        if (upd.status) ms.status = upd.status;
+        if (upd.notes) ms.notes = (ms.notes ? ms.notes + ' | ' : '') + upd.notes;
+        ms.updatedAt = Date.now();
+        proj.updatedAt = Date.now();
+        await storage.set({ urchinProjects });
+        return { success: true, message: `"${upd.milestone}" → ${upd.status}. ${proj.milestones.filter(m => m.status === 'done').length}/${proj.milestones.length} done.` };
+      } catch (e) { return { error: `Update goal failed: ${e.message}` }; }
+    },
+
+    GET_GOALS: async () => {
+      try {
+        const { urchinProjects = {} } = await storage.get('urchinProjects');
+        const projects = Object.entries(urchinProjects);
+        if (projects.length === 0) return { success: true, projects: [], message: 'No project plans.' };
+        return { success: true, projects: projects.map(([name, p]) => ({
+          name, goals: p.goals,
+          milestones: p.milestones.map(m => ({ name: m.name, status: m.status, tasks: m.tasks, notes: m.notes })),
+          progress: `${p.milestones.filter(m => m.status === 'done').length}/${p.milestones.length}`
+        })) };
+      } catch (e) { return { error: `Get goals failed: ${e.message}` }; }
+    },
   };
 }
 
