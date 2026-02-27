@@ -92,6 +92,129 @@ function extractJSON(raw) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
+ * SEMANTIC MEMORY — embeddings + cosine similarity with keyword fallback
+ * ───────────────────────────────────────────────────────────────────────── */
+
+function cosineSimilarity(a, b) {
+  if (!a || !b || a.length !== b.length) return 0;
+  let dot = 0, magA = 0, magB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(magA) * Math.sqrt(magB);
+  return denom === 0 ? 0 : dot / denom;
+}
+
+async function getEmbedding(text, settings) {
+  const apiKey = settings.llmApiKey || settings.apiKey;
+  if (!apiKey) return null;
+  const baseUrl = settings.llmBaseUrl || 'https://api.openai.com/v1';
+  const embUrl = baseUrl.replace(/\/chat\/completions\/?$/, '') + '/embeddings';
+  try {
+    const res = await fetch(embUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model: 'text-embedding-3-small', input: text.slice(0, 2000) }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.data?.[0]?.embedding || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function keywordFallback(query, memory) {
+  const keywords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+  if (keywords.length === 0) return { matches: [], method: 'keyword' };
+  const matches = [];
+  for (const [key, value] of Object.entries(memory)) {
+    if (key.startsWith('_')) continue;
+    const combined = `${key} ${value}`.toLowerCase();
+    const matchCount = keywords.filter(kw => combined.includes(kw)).length;
+    if (matchCount > 0) {
+      matches.push({ key, value: String(value).slice(0, 200), relevance: matchCount / keywords.length });
+    }
+  }
+  matches.sort((a, b) => b.relevance - a.relevance);
+  return { matches: matches.slice(0, 10), method: 'keyword' };
+}
+
+async function semanticRecallWithEmbeddings(query, memory, storage, settings) {
+  const queryEmb = await getEmbedding(query, settings);
+  if (!queryEmb) return keywordFallback(query, memory);
+
+  const { urchinEmbeddingCache = {} } = await storage.get('urchinEmbeddingCache');
+  const matches = [];
+  let cacheUpdated = false;
+
+  for (const [key, value] of Object.entries(memory)) {
+    if (key.startsWith('_')) continue;
+    const text = `${key}: ${value}`;
+    let emb = urchinEmbeddingCache[key];
+    if (!emb) {
+      emb = await getEmbedding(text, settings);
+      if (emb) { urchinEmbeddingCache[key] = emb; cacheUpdated = true; }
+    }
+    if (emb) {
+      const sim = cosineSimilarity(queryEmb, emb);
+      if (sim > 0.25) matches.push({ key, value: String(value).slice(0, 200), relevance: Math.round(sim * 100) / 100 });
+    }
+  }
+
+  if (cacheUpdated) {
+    const keys = Object.keys(urchinEmbeddingCache);
+    if (keys.length > 300) {
+      for (const k of keys.slice(0, keys.length - 300)) delete urchinEmbeddingCache[k];
+    }
+    await storage.set({ urchinEmbeddingCache });
+  }
+
+  matches.sort((a, b) => b.relevance - a.relevance);
+  return { matches: matches.slice(0, 10), method: 'embeddings' };
+}
+
+async function relevanceFilterMemories(userInput, memories, storage, settings, maxResults = 8) {
+  const queryEmb = await getEmbedding(userInput, settings);
+  const { urchinEmbeddingCache = {} } = await storage.get('urchinEmbeddingCache');
+  const scored = [];
+  let cacheUpdated = false;
+
+  for (const [key, value] of Object.entries(memories)) {
+    if (key.startsWith('_')) continue;
+    const text = `${key}: ${String(value).slice(0, 500)}`;
+    if (queryEmb) {
+      let emb = urchinEmbeddingCache[key];
+      if (!emb) {
+        emb = await getEmbedding(text, settings);
+        if (emb) { urchinEmbeddingCache[key] = emb; cacheUpdated = true; }
+      }
+      if (emb) {
+        scored.push({ key, value, sim: cosineSimilarity(queryEmb, emb) });
+        continue;
+      }
+    }
+    const kw = userInput.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+    const combined = text.toLowerCase();
+    const mc = kw.filter(w => combined.includes(w)).length;
+    scored.push({ key, value, sim: kw.length > 0 ? (mc / kw.length) * 0.5 : 0 });
+  }
+
+  if (cacheUpdated) {
+    const keys = Object.keys(urchinEmbeddingCache);
+    if (keys.length > 300) {
+      for (const k of keys.slice(0, keys.length - 300)) delete urchinEmbeddingCache[k];
+    }
+    await storage.set({ urchinEmbeddingCache });
+  }
+
+  scored.sort((a, b) => b.sim - a.sim);
+  return scored.filter(s => s.sim > 0.2).slice(0, maxResults);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
  * BUILT-IN TOOLS (implement only what you need; override via options.tools)
  * ───────────────────────────────────────────────────────────────────────── */
 
@@ -176,21 +299,15 @@ function createBuiltInTools(storage) {
       }
     },
 
-    SEARCH_MEMORY: async (query, _ctx) => {
+    SEARCH_MEMORY: async (query, ctx) => {
       try {
         const { urchinMemory = {}, urchinProfile = {} } = await storage.get(['urchinMemory', 'urchinProfile']);
         const combined = {
           ...urchinMemory,
           ...Object.fromEntries(Object.entries(urchinProfile).map(([k, v]) => [`profile_${k}`, v])),
         };
-        const q = query.toLowerCase();
-        const matches = Object.entries(combined)
-          .filter(([k, v]) => {
-            const str = `${k} ${v}`.toLowerCase();
-            return q.split(/\s+/).some(term => str.includes(term));
-          })
-          .map(([k, v]) => ({ key: k, value: String(v).slice(0, 200) }));
-        return { success: true, query, matches: matches.slice(0, 10) };
+        const settings = ctx?.settings || {};
+        return { success: true, query, ...(await semanticRecallWithEmbeddings(query, combined, storage, settings)) };
       } catch (e) {
         return { error: `Memory search failed: ${e.message}` };
       }
@@ -288,38 +405,88 @@ async function loadMemoryLayers(storage, options) {
   userMsg += '\n' + (options.userInput || '');
   messages.push({ role: 'user', content: userMsg.trim() });
 
-  // Layer 4: User profile (inject into last user message)
+  // Layer 4: User profile (capped at 50 keys)
   if (urchinProfile && Object.keys(urchinProfile).length > 0) {
-    const profileStr = Object.entries(urchinProfile).map(([k, v]) => `  ${k}: ${v}`).join('\n');
+    const profileEntries = Object.entries(urchinProfile).slice(-50);
+    if (Object.keys(urchinProfile).length > 50) {
+      await storage.set({ urchinProfile: Object.fromEntries(profileEntries) });
+    }
+    const profileStr = profileEntries.map(([k, v]) => `  ${k}: ${v}`).join('\n');
     messages[messages.length - 1].content += `\n\n[User profile (permanent):\n${profileStr}]`;
   }
 
-  // Layer 5: Session summaries + manual memories
+  // Layer 5: Relevance-filtered session summaries + manual memories
   const sessionKeys = Object.keys(urchinMemory).filter(k => k.startsWith('session_')).sort().reverse();
-  if (sessionKeys.length > 0) {
-    const recentSessions = sessionKeys.slice(0, 10).map(k => urchinMemory[k]).join('\n---\n');
-    messages[messages.length - 1].content += `\n\n[Past session summaries:\n${recentSessions}]`;
-  }
   const manualKeys = Object.keys(urchinMemory).filter(k => !k.startsWith('session_') && !k.startsWith('_'));
-  if (manualKeys.length > 0) {
-    const manualStr = manualKeys.map(k => `  ${k}: ${urchinMemory[k]}`).join('\n');
-    messages[messages.length - 1].content += `\n\n[Saved memories:\n${manualStr}]`;
+
+  if (manualKeys.length > 100) {
+    const toRemove = manualKeys.slice(0, manualKeys.length - 100);
+    for (const k of toRemove) delete urchinMemory[k];
+    await storage.set({ urchinMemory });
   }
 
-  // Layer 6: Learned skills (optional)
+  const allMemEntries = {};
+  for (const k of sessionKeys.slice(0, 20)) allMemEntries[k] = urchinMemory[k];
+  const currentManualKeys = Object.keys(urchinMemory).filter(k => !k.startsWith('session_') && !k.startsWith('_'));
+  for (const k of currentManualKeys) allMemEntries[k] = urchinMemory[k];
+
+  const totalEntries = Object.keys(allMemEntries).length;
+  const settings = options.settings || {};
+
+  if (totalEntries <= 6) {
+    if (sessionKeys.length > 0) {
+      const sessStr = sessionKeys.slice(0, 10).map(k => urchinMemory[k]).join('\n---\n');
+      messages[messages.length - 1].content += `\n\n[Past session summaries:\n${sessStr}]`;
+    }
+    if (currentManualKeys.length > 0) {
+      const manStr = currentManualKeys.map(k => `  ${k}: ${urchinMemory[k]}`).join('\n');
+      messages[messages.length - 1].content += `\n\n[Saved memories:\n${manStr}]`;
+    }
+  } else {
+    const relevant = await relevanceFilterMemories(options.userInput || '', allMemEntries, storage, settings, 10);
+    const relevantSessions = relevant.filter(r => r.key.startsWith('session_'));
+    const relevantManual = relevant.filter(r => !r.key.startsWith('session_'));
+
+    const sessionSet = new Set(relevantSessions.map(r => r.key));
+    if (sessionKeys[0]) sessionSet.add(sessionKeys[0]);
+
+    if (sessionSet.size > 0) {
+      const sessStr = [...sessionSet].map(k => urchinMemory[k]).filter(Boolean).join('\n---\n');
+      messages[messages.length - 1].content += `\n\n[Relevant session summaries (${sessionSet.size}/${sessionKeys.length} total):\n${sessStr}]`;
+    }
+    if (relevantManual.length > 0) {
+      const manStr = relevantManual.map(r => `  ${r.key}: ${r.value}`).join('\n');
+      messages[messages.length - 1].content += `\n\n[Relevant memories (${relevantManual.length}/${currentManualKeys.length} total):\n${manStr}]`;
+    } else if (currentManualKeys.length > 0 && currentManualKeys.length <= 10) {
+      const manStr = currentManualKeys.map(k => `  ${k}: ${urchinMemory[k]}`).join('\n');
+      messages[messages.length - 1].content += `\n\n[Saved memories:\n${manStr}]`;
+    }
+  }
+
+  // Layer 6: Learned skills — filtered by score, with quality info
+  const activeSkillNames = [];
   if (urchinSkills && urchinSkills.length > 0) {
-    const skillBlock = urchinSkills.map(s => `  • ${s.name}: ${s.instruction}`).join('\n');
-    messages[messages.length - 1].content += `\n\n[Learned skills (apply these):\n${skillBlock}]`;
+    const viable = urchinSkills.filter(s => (s.score ?? 50) > 15);
+    if (viable.length > 0) {
+      const skillBlock = viable.map(s => {
+        s.usageCount = (s.usageCount || 0) + 1;
+        s.lastUsedAt = Date.now();
+        activeSkillNames.push(s.name);
+        return `  • ${s.name} [score:${s.score ?? 50}]: ${s.instruction}`;
+      }).join('\n');
+      messages[messages.length - 1].content += `\n\n[Learned skills (apply these):\n${skillBlock}]`;
+      await storage.set({ urchinSkills });
+    }
   }
 
-  return messages;
+  return { messages, activeSkillNames };
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
  * POST-RESPONSE JOBS (background memory maintenance)
  * ───────────────────────────────────────────────────────────────────────── */
 
-async function runPostResponseJobs(storage, messages, history, callLLM, settings) {
+async function runPostResponseJobs(storage, messages, history, callLLM, settings, activeSkillNames = []) {
   const { urchinMemory = {}, urchinCondensed = '' } = await storage.get(['urchinMemory', 'urchinCondensed']);
   const convCount = parseInt(urchinMemory._convCount || '0', 10) + 1;
   urchinMemory._convCount = String(convCount);
@@ -384,6 +551,42 @@ async function runPostResponseJobs(storage, messages, history, callLLM, settings
       await storage.set({ urchinCondensed: newCondensed.slice(-MAX_CONDENSED_CHARS) });
     }
   }
+
+  // D) Skill self-evaluation — every 10th conversation, score and prune
+  if (convCount % 10 === 0 && activeSkillNames.length > 0 && messages.length >= 4) {
+    try {
+      const { urchinSkills = [] } = await storage.get('urchinSkills');
+      const activeForEval = urchinSkills.filter(s => activeSkillNames.includes(s.name));
+      if (activeForEval.length > 0) {
+        const recentConvo = messages.slice(-10).map(m => `${m.role}: ${String(m.content).slice(0, 400)}`).join('\n');
+        const skillList = activeForEval.map(s =>
+          `  "${s.name}": "${s.instruction}" (used ${s.usageCount || 0}x, score: ${s.score ?? 50})`
+        ).join('\n');
+        const evalPrompt = `Evaluate whether these learned skills helped in the recent conversation.\n\nActive skills:\n${skillList}\n\nRecent conversation:\n${recentConvo}\n\nScore each skill 0-100:\n- 80-100: clearly applied and helpful\n- 50-70: relevant but unclear impact\n- 20-49: irrelevant to user's needs\n- 0-19: actively wrong or user corrected the behavior\n\nOutput ONLY JSON: {"scores":{"skill-name": <number>}}`;
+        const evalRaw = await callLLM('Output ONLY a JSON object with a "scores" field.', [{ role: 'user', content: evalPrompt }], settings);
+        const evalResult = extractJSON(evalRaw);
+        if (evalResult?.scores) {
+          for (const [name, newScore] of Object.entries(evalResult.scores)) {
+            const skill = urchinSkills.find(s => s.name === name);
+            if (skill && typeof newScore === 'number') {
+              const oldScore = skill.score ?? 50;
+              skill.score = Math.round(oldScore * 0.6 + Math.max(0, Math.min(100, newScore)) * 0.4);
+              skill.lastEvalAt = Date.now();
+              skill.evalCount = (skill.evalCount || 0) + 1;
+            }
+          }
+          const pruned = urchinSkills.filter(s => {
+            if ((s.score ?? 50) <= 10 && (s.evalCount || 0) >= 2) return false;
+            if ((s.usageCount || 0) > 30 && (s.score ?? 50) <= 20) return false;
+            const age = Date.now() - (s.learnedAt || 0);
+            if (age > 30 * 24 * 60 * 60 * 1000 && (s.usageCount || 0) === 0) return false;
+            return true;
+          });
+          await storage.set({ urchinSkills: pruned });
+        }
+      }
+    } catch (_) {}
+  }
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -407,7 +610,9 @@ async function urchinLoop(userInput, options = {}) {
   } = options;
 
   const allTools = { ...createBuiltInTools(storage), ...customTools };
-  const messages = await loadMemoryLayers(storage, { userInput, history, pageContext, context });
+  const memResult = await loadMemoryLayers(storage, { userInput, history, pageContext, context, settings });
+  const messages = memResult.messages || memResult;
+  const activeSkillNames = memResult.activeSkillNames || [];
   trimMessagesToBudget(messages);
 
   let finalAnswer = '';
@@ -466,7 +671,7 @@ async function urchinLoop(userInput, options = {}) {
   // Post-response jobs (fire-and-forget)
   if (runPostJobs && finalAnswer) {
     setTimeout(() => {
-      runPostResponseJobs(storage, messages, newHistory, callLLM, settings).catch(() => {});
+      runPostResponseJobs(storage, messages, newHistory, callLLM, settings, activeSkillNames).catch(() => {});
     }, 100);
   }
 
@@ -492,7 +697,7 @@ TOOLS — include the exact tag to invoke:
 <<TOOL:FETCH_URL:url>> — Fetch and read webpage content.
 <<TOOL:REMEMBER:{"key":"...","value":"..."}>> — Save to persistent memory.
 <<TOOL:RECALL:key>> — Recall saved info. Use "all" for everything.
-<<TOOL:SEARCH_MEMORY:query>> — Fuzzy search across memories.
+<<TOOL:SEARCH_MEMORY:query>> — Semantic search across memories (embeddings when available, keyword fallback).
 
 RULES:
 1. ALWAYS start non-trivial responses with <<THINK>>...your reasoning...<</THINK>>
@@ -514,6 +719,11 @@ if (typeof module !== 'undefined' && module.exports) {
     createBuiltInTools,
     defaultCallLLM,
     extractJSON,
+    cosineSimilarity,
+    getEmbedding,
+    semanticRecallWithEmbeddings,
+    keywordFallback,
+    relevanceFilterMemories,
     TOOL_REGEX,
     TOOL_REGEX_SINGLE,
     THINK_REGEX,
@@ -528,6 +738,11 @@ if (typeof window !== 'undefined') {
     createBuiltInTools,
     defaultCallLLM,
     extractJSON,
+    cosineSimilarity,
+    getEmbedding,
+    semanticRecallWithEmbeddings,
+    keywordFallback,
+    relevanceFilterMemories,
     TOOL_REGEX,
     TOOL_REGEX_SINGLE,
     THINK_REGEX,
