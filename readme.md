@@ -23,15 +23,27 @@ UrchinLoop is not a chatbot wrapper. It is a deterministic think-act-observe loo
   │   └────────────┬────────────┘               │
   │                v                            │
   │   ┌─────────────────────────┐               │
-  │   │     Reasoning Loop      │               │
-  │   │  THINK → ACT → OBSERVE → DECIDE         │
-  │   │    ^                        │           │
-  │   │    └────────────────────────┘           │
-  │   │       (up to 12 iterations)             │
-  │   └────────────┬────────────┘               │
-  │                v                            │
+  │   │   Goal Decomposition    │               │
+  │   │  (multi-phase planner)  │               │
+  │   └──────┬──────────┬───────┘               │
+  │     single│    multi-phase                  │
+  │          v          v                       │
+  │   ┌───────────┐  ┌──────────────┐           │
+  │   │ Reasoning │  │  Subtask     │           │
+  │   │   Loop    │  │  Orchestrator│           │
+  │   │ THINK →   │  │  (recursive  │           │
+  │   │ ACT →     │  │   urchinLoop │           │
+  │   │ OBSERVE → │  │   per step)  │           │
+  │   │ DECIDE    │  └──────┬───────┘           │
+  │   │ (12 iter) │         │ synthesize        │
+  │   └─────┬─────┘  ┌──────v───────┐           │
+  │         │        │  Synthesis   │           │
+  │         │        └──────┬───────┘           │
+  │         └───────┬───────┘                   │
+  │                 v                           │
   │   ┌─────────────────────────┐               │
   │   │    Post-Response Jobs   │               │
+  │   │  + Satisfaction Signal  │               │
   │   └─────────────────────────┘               │
   └─────────────────────────────────────────────┘
            │              │              │
@@ -68,7 +80,24 @@ Layers 4 and 5 are **relevance-filtered** — when more than 6 entries exist, on
 
 The engine constructs a rich context object from the environment: page URL, visible text, selected text, platform-specific extraction (Twitter, DexScreener, pump.fun, etc.), and uploaded files.
 
-### 3. Reasoning Loop (THINK → ACT → OBSERVE → DECIDE)
+### 3. Goal Decomposition
+
+Before the reasoning loop, multi-phase requests are detected and broken into subtask chains:
+
+```
+1. Detect multi-phase request (multiple verbs, long input, "and then" connectors)
+2. Ask LLM to plan: {"decompose":true, "subtasks":[{"task":"...", "dependsOn":[]}]}
+3. If decomposed (2-4 subtasks):
+     - Execute each subtask recursively through the full urchinLoop
+     - Pass prior step results forward via dependsOn references
+     - Synthesize all outputs into a unified response
+4. If not decomposed:
+     - Fall through to the normal reasoning loop
+```
+
+Single tasks (even complex ones) are never decomposed — only genuinely multi-phase requests that produce different outputs per phase.
+
+### 4. Reasoning Loop (THINK → ACT → OBSERVE → DECIDE)
 
 The core loop runs up to 12 iterations:
 
@@ -86,7 +115,7 @@ for each step (max 12):
          - Break loop
 ```
 
-### 4. Chain-of-Thought
+### 5. Chain-of-Thought
 
 The system prompt enforces mandatory `<<THINK>>` blocks:
 
@@ -100,7 +129,7 @@ The user wants to compare three tokens. I should:
 <</THINK>>
 ```
 
-### 5. Tool Protocol
+### 6. Tool Protocol
 
 Tools are invoked via text tags in the LLM response:
 
@@ -256,7 +285,7 @@ const exampleTools = {
 | `urchinMemory` | Session summaries + manual memories + conversation count |
 | `urchinProfile` | Auto-extracted user profile |
 | `urchinChatHistory` | Raw chat messages (max 200) |
-| `urchinSkills` | Learned behavioral skills with scores, usage counts, eval history |
+| `urchinSkills` | Learned behavioral skills with scores, usage counts, signal counts, eval history |
 | `urchinEmbeddingCache` | Cached embedding vectors for semantic memory search (max 300) |
 
 ---
@@ -298,8 +327,10 @@ The `urchinloop.js` file in this folder is a complete, portable implementation y
 
 - **All 6 memory layers** — condensed history, recent messages, profile (capped at 50), session summaries, manual memories (capped at 100), learned skills (scored & pruned)
 - **Relevance-filtered injection** — sessions and memories are filtered by semantic similarity to the current message, preventing context rot
+- **Goal decomposition** — multi-phase requests planned into subtask chains with dependency tracking, each running through the full loop recursively
+- **Implicit satisfaction signals** — detects user corrections, frustration, praise, and conversation length to adjust skill scores every turn
 - **Built-in tools** — `WEB_SEARCH`, `FETCH_URL`, `REMEMBER`, `RECALL`, `SEARCH_MEMORY` (embeddings-based with keyword fallback)
-- **Post-response jobs** — automatic session summarization, profile extraction, history condensation, skill self-evaluation & pruning
+- **Post-response jobs** — satisfaction signal processing, session summarization, profile extraction, history condensation, skill self-evaluation & pruning
 - **Pluggable storage** — default in-memory; replace with `localStorage`, Redis, or any async key-value store
 - **Pluggable LLM** — default OpenAI-compatible; swap for Anthropic, local models, etc.
 
