@@ -57,10 +57,12 @@ Six layers of memory are loaded and injected into the LLM context:
 |-------|--------|-------------|------|
 | Condensed History | Compressed narrative of all past conversations | Permanent, rewritten on overflow | Up to 4000 chars |
 | Recent Messages | Last 30 chat messages at full fidelity | Session-persistent, rolls off | 30 messages |
-| User Profile | Auto-extracted user knowledge (wallets, preferences, projects) | Permanent, auto-updated | Unlimited keys |
-| Session Summaries | Bullet-point summaries of past sessions | Last 20 kept, 1500 chars each | 20 entries |
-| Manual Memories | Explicitly saved via REMEMBER tool | Permanent until wiped | Unlimited keys |
+| User Profile | Auto-extracted user knowledge (wallets, preferences, projects) | Permanent, auto-updated, capped at 50 keys | 50 keys |
+| Session Summaries | Bullet-point summaries of past sessions | Last 20 kept, relevance-filtered on injection | 20 entries |
+| Manual Memories | Explicitly saved via REMEMBER tool | Permanent, capped at 100, oldest evicted | 100 entries |
 | Learned Skills | Self-evolving behavioral instructions, scored 0-100 | Auto-pruned when ineffective | Up to 50 skills |
+
+Layers 4 and 5 are **relevance-filtered** — when more than 6 entries exist, only memories semantically relevant to the current user message are injected into context. This prevents context rot as memory accumulates over time. The most recent session summary is always included for conversational continuity.
 
 ### 2. Build Context
 
@@ -294,7 +296,8 @@ MIT
 
 The `urchinloop.js` file in this folder is a complete, portable implementation you can drop into any project. It includes:
 
-- **All 6 memory layers** — condensed history, recent messages, profile, session summaries, manual memories, learned skills (scored & pruned)
+- **All 6 memory layers** — condensed history, recent messages, profile (capped at 50), session summaries, manual memories (capped at 100), learned skills (scored & pruned)
+- **Relevance-filtered injection** — sessions and memories are filtered by semantic similarity to the current message, preventing context rot
 - **Built-in tools** — `WEB_SEARCH`, `FETCH_URL`, `REMEMBER`, `RECALL`, `SEARCH_MEMORY` (embeddings-based with keyword fallback)
 - **Post-response jobs** — automatic session summarization, profile extraction, history condensation, skill self-evaluation & pruning
 - **Pluggable storage** — default in-memory; replace with `localStorage`, Redis, or any async key-value store
