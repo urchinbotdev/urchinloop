@@ -12,8 +12,8 @@ UrchinLoop is not a chatbot wrapper. It is a deterministic think-act-observe loo
                     UrchinLoop Engine
   ┌─────────────────────────────────────────────┐
   │   ┌──────────┐    ┌──────────┐              │
-  │   │  Memory   │    │  Context  │              │
-  │   │  System   │    │  Builder  │              │
+  │   │  Memory   │    │  Context  │            │
+  │   │  System   │    │  Builder  │            │
   │   └────┬─────┘    └─────┬────┘              │
   │        │                │                   │
   │        v                v                   │
